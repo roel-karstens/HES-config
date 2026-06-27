@@ -35,7 +35,7 @@ def optimise(cfg: SystemConfig) -> SystemConfig:
     # ── Battery initial SOC optimisation ──────────────────────────────────────
     # If prices are flat (no TOU), default SOC is fine.
     # With TOU: pre-charge battery slightly in the cheapest night hours.
-    if opt_cfg.economics.time_of_use and opt_cfg.battery.enabled:
+    if opt_cfg.economics.time_of_use and opt_cfg.battery.enabled and opt_cfg.battery.capacity_kwh > 0:
         # Find the cheapest 3 off-peak hours (no solar: hours 0-5 or 22-23)
         night_hours = list(range(0, 6)) + list(range(22, 24))
         night_prices = [(prices[h], h) for h in night_hours]

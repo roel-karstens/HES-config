@@ -1,5 +1,4 @@
 from dataclasses import dataclass, field
-from typing import Optional
 
 
 @dataclass
@@ -31,6 +30,13 @@ class HeatPumpConfig:
 
 
 @dataclass
+class AircoConfig:
+    enabled: bool = False
+    daily_kwh: float = 4.0
+    intensity: float = 1.0
+
+
+@dataclass
 class HouseholdConfig:
     base_kwh_day: float = 10.0
     peak_multiplier: float = 2.0  # evening factor
@@ -49,5 +55,6 @@ class SystemConfig:
     battery: BatteryConfig = field(default_factory=BatteryConfig)
     ev: EVConfig = field(default_factory=EVConfig)
     heat_pump: HeatPumpConfig = field(default_factory=HeatPumpConfig)
+    airco: AircoConfig = field(default_factory=AircoConfig)
     household: HouseholdConfig = field(default_factory=HouseholdConfig)
     economics: EconomicsConfig = field(default_factory=EconomicsConfig)

@@ -1,5 +1,4 @@
 import numpy as np
-import pandas as pd
 from models import SystemConfig
 
 
@@ -80,6 +79,20 @@ def _heat_pump_profile(cfg: SystemConfig) -> np.ndarray:
     return shape * daily
 
 
+def _airco_profile(cfg: SystemConfig) -> np.ndarray:
+    """kWh per hour for cooling load (AIRCO)."""
+    if not cfg.airco.enabled:
+        return np.zeros(24)
+    daily = cfg.airco.daily_kwh * max(cfg.airco.intensity, 0.0)
+    # Midday and early evening cooling demand.
+    shape = np.zeros(24)
+    shape[11:18] = 1.2
+    shape[18:22] = 0.8
+    shape[9:11] = 0.4
+    shape = shape / shape.sum()
+    return shape * daily
+
+
 def _import_prices(cfg: SystemConfig) -> np.ndarray:
     if cfg.economics.time_of_use:
         # scale TOU so average ≈ flat rate
@@ -96,7 +109,8 @@ def simulate(cfg: SystemConfig) -> dict:
     household = _household_profile(cfg)
     ev = _ev_profile(cfg)
     heat_pump = _heat_pump_profile(cfg)
-    total_demand = household + ev + heat_pump
+    airco = _airco_profile(cfg)
+    total_demand = household + ev + heat_pump + airco
     prices = _import_prices(cfg)
 
     # battery state
@@ -168,6 +182,7 @@ def simulate(cfg: SystemConfig) -> dict:
         "household": household,
         "ev": ev,
         "heat_pump": heat_pump,
+        "airco": airco,
         "total_demand": total_demand,
         "battery_charge": battery_charge,
         "battery_discharge": battery_discharge,
