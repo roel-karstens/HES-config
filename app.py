@@ -12,10 +12,17 @@ from plotly.subplots import make_subplots
 
 from models import (
     SystemConfig, SolarConfig, BatteryConfig, EVConfig,
-    HeatPumpConfig, AircoConfig, HouseholdConfig, EconomicsConfig,
+    HeatPumpConfig, AircoConfig, HouseholdConfig, EconomicsConfig, UserGoals, CandidateConfig,
 )
 from simulation import simulate
-from optimizer import optimise, compute_payback
+from optimizer import (
+    optimise,
+    compute_payback,
+    evaluate_candidate,
+    generate_candidates,
+    rank_candidates,
+)
+from recommendation import answer_user_question, recommend_top_configuration
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -201,6 +208,15 @@ DEFAULT_STATE = {
     "price_ev": int(11.0 * EV_CHARGER_PRICE_PER_KW),
     "price_hp": HEAT_PUMP_PRICE_PER_KW,
     "price_ac": AIRCO_PRICE_PER_KW,
+    "lock_hh_base": False,
+    "lock_solar_kwp": False,
+    "lock_bat_cap": False,
+    "lock_ev_daily": False,
+    "lock_hp_daily": False,
+    "lock_ac_daily": False,
+    "last_optimization_result": None,
+    "pending_slider_updates": None,
+    "optimization_notice": "",
 }
 
 
@@ -208,6 +224,16 @@ def _init_sidebar_state() -> None:
     for key, value in DEFAULT_STATE.items():
         if key not in st.session_state:
             st.session_state[key] = value
+
+
+def _apply_pending_slider_updates() -> None:
+    """Apply optimized slider updates before widgets are instantiated."""
+    pending = st.session_state.get("pending_slider_updates")
+    if not pending:
+        return
+    for key, value in pending.items():
+        st.session_state[key] = value
+    st.session_state["pending_slider_updates"] = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -245,6 +271,122 @@ def hex_to_rgba(hex_color: str, alpha: float) -> str:
     g = int(hex_color[2:4], 16)
     b = int(hex_color[4:6], 16)
     return f"rgba({r},{g},{b},{alpha})"
+
+
+SIZING_SPECS = {
+    "hh_base": {"label": "Household load (kWh/day)", "min": 0.0, "max": 40.0, "step": 0.5, "coarse_step": 2.0},
+    "solar_kwp": {"label": "Solar size (kWp)", "min": 0.0, "max": 20.0, "step": 0.5, "coarse_step": 1.0},
+    "bat_cap": {"label": "Battery size (kWh)", "min": 0.0, "max": 30.0, "step": 0.5, "coarse_step": 1.0},
+    "ev_daily": {"label": "EV energy (kWh/day)", "min": 0.0, "max": 30.0, "step": 0.5, "coarse_step": 2.0},
+    "hp_daily": {"label": "Heat pump demand (kWh/day)", "min": 0.0, "max": 30.0, "step": 0.5, "coarse_step": 2.0},
+    "ac_daily": {"label": "AIRCO demand (kWh/day)", "min": 0.0, "max": 20.0, "step": 0.5, "coarse_step": 2.0},
+}
+
+
+def _candidate_values_for_field(key: str, current: float, locked: bool) -> list[float]:
+    spec = SIZING_SPECS[key]
+    if locked:
+        return [float(current)]
+
+    if key in {"solar_kwp", "bat_cap"}:
+        vals = np.arange(spec["min"], spec["max"] + 1e-9, spec["coarse_step"])  # dense for true sizing knobs
+    else:
+        # Keep non-sizing demand variables local to the current situation for stability.
+        vals = np.array([current - spec["coarse_step"], current, current + spec["coarse_step"]])
+    vals = np.clip(vals, spec["min"], spec["max"])
+    vals = np.round(vals / spec["step"]) * spec["step"]
+    return sorted({float(v) for v in vals})
+
+
+def run_roi_lock_optimization(state: dict) -> dict | None:
+    keys = ["hh_base", "solar_kwp", "bat_cap", "ev_daily", "hp_daily", "ac_daily"]
+    lock_map = {k: bool(state.get(f"lock_{k}", False)) for k in keys}
+    if all(lock_map.values()):
+        return None
+
+    value_grid = {
+        k: _candidate_values_for_field(k, float(state[k]), lock_map[k])
+        for k in keys
+    }
+
+    best = None
+    evaluated = 0
+    for hh in value_grid["hh_base"]:
+        for solar in value_grid["solar_kwp"]:
+            for batt in value_grid["bat_cap"]:
+                for ev_d in value_grid["ev_daily"]:
+                    for hp_d in value_grid["hp_daily"]:
+                        for ac_d in value_grid["ac_daily"]:
+                            for strategy in ["pv_optimized", "price_optimized"]:
+                                candidate = {
+                                    "hh_base": hh,
+                                    "solar_kwp": solar,
+                                    "bat_cap": batt,
+                                    "ev_daily": ev_d,
+                                    "hp_daily": hp_d,
+                                    "ac_daily": ac_d,
+                                    "strategy": strategy,
+                                }
+                                context = {
+                                    "import_price": float(state["import_price"]),
+                                    "feedin_tariff": float(state["feedin_tariff"]),
+                                    "household_kwh_day": hh,
+                                    "heat_pump_kwh_day": hp_d,
+                                    "ev_weekly_kwh": ev_d * 7.0,
+                                    "airco_kwh_day": ac_d,
+                                    "price_solar_per_kwp": float(state["price_solar"]),
+                                    "price_battery_per_kwh": float(state["price_battery"]),
+                                    "price_ev_charger": float(state["price_ev"] if ev_d > 0 else 0.0),
+                                    "price_heat_pump": float((state["price_hp"] * (hp_d / 1.5)) if hp_d > 0 else 0.0),
+                                    "budget_eur": None,
+                                }
+
+                                eval_item = evaluate_candidate(
+                                    candidate=CandidateConfig(
+                                        solar_kwp=solar,
+                                        battery_kwh=batt,
+                                        heat_pump_enabled=hp_d > 0,
+                                        ev_enabled=ev_d > 0,
+                                        v2g_enabled=False,
+                                        charging_strategy=strategy,
+                                    ),
+                                    context=context,
+                                )
+                                evaluated += 1
+
+                                if best is None:
+                                    best = (candidate, eval_item)
+                                else:
+                                    _, best_eval = best
+                                    better_score = eval_item.score > best_eval.score
+                                    tie_score = np.isclose(eval_item.score, best_eval.score)
+                                    better_payback = eval_item.payback_years < best_eval.payback_years
+                                    tie_payback = np.isclose(eval_item.payback_years, best_eval.payback_years)
+                                    better_capex = eval_item.capex_eur < best_eval.capex_eur
+                                    better_grid = float(eval_item.evidence.get("grid_dependency_pct", 100.0)) < float(best_eval.evidence.get("grid_dependency_pct", 100.0))
+
+                                    if better_score or (tie_score and (better_payback or (tie_payback and (better_capex or better_grid)))):
+                                        best = (candidate, eval_item)
+
+    if best is None:
+        return None
+
+    best_candidate, best_eval = best
+    before = {k: float(state[k]) for k in keys}
+    after = {k: float(best_candidate[k]) for k in keys}
+    changes = {k: (before[k], after[k]) for k in keys if not np.isclose(before[k], after[k])}
+
+    return {
+        "evaluated": evaluated,
+        "before": before,
+        "after": after,
+        "changes": changes,
+        "score": float(best_eval.score),
+        "annual_savings_eur": float(best_eval.annual_savings_eur),
+        "capex_eur": float(best_eval.capex_eur),
+        "payback_years": float(best_eval.payback_years),
+        "strategy": str(best_candidate["strategy"]),
+    }
 
 
 @st.cache_data(show_spinner=False)
@@ -321,7 +463,12 @@ def compute_design_space(
             annual_savings = elec_savings + gas_savings_yr + fixed_savings_yr
             capex = float(fixed_capex + solar_kwp_val * p_solar + battery_kwh * p_battery)
             payback = compute_payback(capex, annual_savings)
-            optimization_score = annual_savings - capex
+            
+            # Efficiency-based scoring (matches Tab 6)
+            if capex > 0:
+                optimization_score = annual_savings / capex * 1000.0
+            else:
+                optimization_score = 0.0
 
             annual_savings_grid[bi, si] = annual_savings
             payback_grid[bi, si] = payback if np.isfinite(payback) else np.nan
@@ -352,6 +499,7 @@ def compute_design_space(
 # ─────────────────────────────────────────────────────────────────────────────
 
 _init_sidebar_state()
+_apply_pending_slider_updates()
 
 with st.sidebar:
     st.markdown("""
@@ -365,17 +513,42 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
 
+    if st.session_state.get("optimization_notice"):
+        st.success(st.session_state["optimization_notice"])
+        st.session_state["optimization_notice"] = ""
+
     st.markdown("### 📅 Day Scenario")
     st.slider("Sun hours", min_value=0, max_value=16, step=1, key="sun_hours")
     st.slider("Temperature (C)", min_value=-10, max_value=35, step=1, key="ambient_temp_c")
 
     st.markdown("### ⚙️ System Sizing")
-    st.slider("Household load (kWh/day)", min_value=0.0, max_value=40.0, step=0.5, key="hh_base")
-    st.slider("Solar size (kWp)", min_value=0.0, max_value=20.0, step=0.5, key="solar_kwp")
-    st.slider("Battery size (kWh)", min_value=0.0, max_value=30.0, step=0.5, key="bat_cap")
-    st.slider("EV energy (kWh/day)", min_value=0.0, max_value=30.0, step=0.5, key="ev_daily")
-    st.slider("Heat pump demand (kWh/day)", min_value=0.0, max_value=30.0, step=0.5, key="hp_daily")
-    st.slider("AIRCO demand (kWh/day)", min_value=0.0, max_value=20.0, step=0.5, key="ac_daily")
+    for key in ["hh_base", "solar_kwp", "bat_cap", "ev_daily", "hp_daily", "ac_daily"]:
+        spec = SIZING_SPECS[key]
+        c_slider, c_lock = st.columns([4, 1])
+        with c_slider:
+            st.slider(spec["label"], min_value=spec["min"], max_value=spec["max"], step=spec["step"], key=key)
+        with c_lock:
+            st.toggle("Lock", key=f"lock_{key}", label_visibility="collapsed", help=f"Lock {spec['label']} for optimization")
+
+    unlocked_count = sum(0 if st.session_state.get(f"lock_{k}", False) else 1 for k in SIZING_SPECS.keys())
+    optimize_disabled = unlocked_count == 0
+    if optimize_disabled:
+        st.caption("All sizing sliders are locked. Unlock at least one field to optimize.")
+
+    if st.button("Optimize for ROI", disabled=optimize_disabled, use_container_width=True):
+        opt_result = run_roi_lock_optimization(st.session_state)
+        if opt_result is None:
+            st.warning("No feasible optimization result found.")
+        else:
+            pending = {
+                k: v
+                for k, v in opt_result["after"].items()
+                if not st.session_state.get(f"lock_{k}", False)
+            }
+            st.session_state["pending_slider_updates"] = pending
+            st.session_state["last_optimization_result"] = opt_result
+            st.session_state["optimization_notice"] = f"Optimization applied. Evaluated {opt_result['evaluated']} candidates."
+            st.rerun()
 
     st.markdown("### 🏷️ System Prices")
     st.slider("Solar (€/kWp)", min_value=0, max_value=3000, step=50, key="price_solar")
@@ -536,7 +709,14 @@ st.markdown("<br>", unsafe_allow_html=True)
 # ─────────────────────────────────────────────────────────────────────────────
 # Charts
 # ─────────────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["⚡ Energy Usage Timeline", "🔋 Battery", "💰 Cost Analysis", "📈 ROI", "🧭 System Optimizer"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "⚡ Energy Usage Timeline",
+    "🔋 Battery",
+    "💰 Cost Analysis",
+    "📈 ROI",
+    "🧭 System Optimizer",
+    "🧠 Energy Advisor",
+])
 
 hours = HOUR_LABELS
 
@@ -724,6 +904,30 @@ with tab1:
                 showlegend=True,
             )
             st.plotly_chart(fig_pie2, width="stretch")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    if st.session_state.get("last_optimization_result"):
+        opt = st.session_state["last_optimization_result"]
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown('<div class="chart-panel">', unsafe_allow_html=True)
+        st.markdown("**Last ROI Optimization**")
+        c_o1, c_o2, c_o3, c_o4 = st.columns(4)
+        with c_o1:
+            st.markdown(metric_card("Candidates evaluated", f"{opt['evaluated']}", "Unlocked dimensions search"), unsafe_allow_html=True)
+        with c_o2:
+            st.markdown(metric_card("Expected annual savings", fmt_eur(opt["annual_savings_eur"]), "ROI objective result", cls="good"), unsafe_allow_html=True)
+        with c_o3:
+            pb = f"{opt['payback_years']:.1f} years" if np.isfinite(opt["payback_years"]) else "N/A"
+            st.markdown(metric_card("Estimated payback", pb, f"Strategy: {opt['strategy']}"), unsafe_allow_html=True)
+        with c_o4:
+            st.markdown(metric_card("Estimated capex", fmt_eur(opt["capex_eur"]), "Best candidate"), unsafe_allow_html=True)
+
+        if opt["changes"]:
+            st.markdown("**Applied Slider Changes**")
+            for k, (old_v, new_v) in opt["changes"].items():
+                st.write(f"- {SIZING_SPECS[k]['label']}: {old_v:.1f} -> {new_v:.1f}")
+        else:
+            st.caption("No slider changes were needed. Current values were already near-optimal for ROI.")
         st.markdown('</div>', unsafe_allow_html=True)
 
 
@@ -1021,20 +1225,34 @@ with tab5:
     best_savings_solar = float(solar_sizes[best_savings_idx[1]])
     best_savings = float(savings_grid[best_savings_idx])
 
-    best_score_idx = np.unravel_index(np.argmax(optimization_grid), optimization_grid.shape)
-    best_score_battery = float(battery_sizes[best_score_idx[0]])
-    best_score_solar = float(solar_sizes[best_score_idx[1]])
-    best_score = float(optimization_grid[best_score_idx])
+    # Find best efficiency score among viable systems (solar >= 5 kWp OR battery >= 5 kWh)
+    # This avoids recommending undersized systems like 3 kWp which have high efficiency but low impact
+    viable_points = [
+        p for p in points
+        if (p["solar"] >= 5.0 or p["battery"] >= 5.0)  # Minimum viable system size
+    ]
+    
+    if viable_points:
+        best_p = max(viable_points, key=lambda p: p["score"])
+        best_score_solar = best_p["solar"]
+        best_score_battery = best_p["battery"]
+        best_score = best_p["score"]
+    else:
+        # Fallback to overall best if no viable configs found
+        best_score_idx = np.unravel_index(np.argmax(optimization_grid), optimization_grid.shape)
+        best_score_battery = float(battery_sizes[best_score_idx[0]])
+        best_score_solar = float(solar_sizes[best_score_idx[1]])
+        best_score = float(optimization_grid[best_score_idx])
 
     c_opt1, c_opt2, c_opt3 = st.columns(3)
     with c_opt1:
-        st.markdown(metric_card("Best annual savings", fmt_eur(best_savings), f"Solar {best_savings_solar:.0f} kWp · Battery {best_savings_battery:.0f} kWh", cls="good"), unsafe_allow_html=True)
+        st.markdown(metric_card("⭐ Best efficiency config", f"{best_score_solar:.0f} kWp / {best_score_battery:.0f} kWh", f"Score: {best_score:.0f}", cls="good"), unsafe_allow_html=True)
     with c_opt2:
-        st.markdown(metric_card("Best optimization score", fmt_eur(best_score), "Annual savings − capex", cls="warn"), unsafe_allow_html=True)
+        st.markdown(metric_card("Efficiency score formula", "savings ÷ capex × 1000", "Prevents oversizing (recommended)", cls="good"), unsafe_allow_html=True)
     with c_opt3:
-        st.markdown(metric_card("Best score sizing", f"{best_score_solar:.0f} / {best_score_battery:.0f}", "Solar kWp / Battery kWh"), unsafe_allow_html=True)
+        st.markdown(metric_card("Peak annual savings", fmt_eur(best_savings), f"At {best_savings_solar:.0f} kWp (absolute max, less efficient)"), unsafe_allow_html=True)
 
-    st.caption("Heatmap values are annual savings in € per year. Green means higher savings; red means lower or negative savings.")
+    st.caption("Heatmap: Annual savings landscape. ⭐ Star = best efficiency-based recommendation (realistic sizing). Green = higher savings, Red = lower/negative.")
     fig_heat = go.Figure(
         data=go.Heatmap(
             x=solar_sizes,
@@ -1054,21 +1272,20 @@ with tab5:
     )
     fig_heat.update_layout(
         **PLOTLY_LAYOUT,
-        title=dict(text="Annual Savings Heatmap (Solar vs Battery)", font=dict(size=13, color=TEXT_MAIN), x=0),
+        title=dict(text="System Sizing Landscape: Annual Savings (€/year)", font=dict(size=13, color=TEXT_MAIN), x=0),
         height=380,
         xaxis_title="Solar size (kWp)",
         yaxis_title="Battery size (kWh)",
     )
     fig_heat.add_trace(go.Scatter(
-        x=[best_savings_solar],
-        y=[best_savings_battery],
+        x=[best_score_solar],
+        y=[best_score_battery],
         mode="markers",
-        name="Best annual savings",
-        marker=dict(symbol="x", size=12, color=TEXT_MAIN, line=dict(width=1, color=PANEL_BG)),
+        name="⭐ Recommended (efficiency-best)",
+        marker=dict(symbol="star", size=15, color=ACCENT, line=dict(width=2, color=TEXT_MAIN)),
         hovertemplate=(
-            f"Best annual savings point<br>Solar: {best_savings_solar:.0f} kWp<br>"
-            f"Battery: {best_savings_battery:.0f} kWh<br>Annual savings: {fmt_eur(best_savings)}"
-            "<extra></extra>"
+            f"⭐ Recommended by efficiency scoring<br>Solar: {best_score_solar:.0f} kWp<br>"
+            f"Battery: {best_score_battery:.0f} kWh<br>Efficiency score: {best_score:.0f}<extra></extra>"
         ),
     ))
     st.plotly_chart(fig_heat, width="stretch")
@@ -1107,7 +1324,7 @@ with tab5:
                 cmin=float(np.min(optimization_grid)),
                 cmax=float(np.max(optimization_grid)),
                 opacity=0.45,
-                colorbar=dict(title="Score (€/year)", tickprefix="€"),
+                colorbar=dict(title="Efficiency score<br>(savings/capex×1000)", tickprefix=""),
             ),
             customdata=np.array([[p["solar"], p["battery"], p["score"]] for p in other_points]),
             hovertemplate=(
@@ -1115,7 +1332,7 @@ with tab5:
                 "Battery: %{customdata[1]:.0f} kWh<br>"
                 "Capex: €%{x:,.0f}<br>"
                 "Annual savings: €%{y:,.0f}<br>"
-                "Score (savings - capex): €%{customdata[2]:,.0f}<extra>Other</extra>"
+                "Efficiency score: %{customdata[2]:.1f} (savings/capex×1000)<extra>Other designs</extra>"
             ),
         ))
     if pareto_points:
@@ -1133,7 +1350,7 @@ with tab5:
                 "Battery: %{customdata[1]:.0f} kWh<br>"
                 "Capex: €%{x:,.0f}<br>"
                 "Annual savings: €%{y:,.0f}<br>"
-                "Score (savings - capex): €%{customdata[2]:,.0f}<extra>Pareto</extra>"
+                "Efficiency score: %{customdata[2]:.1f}<extra>Pareto frontier</extra>"
             ),
         ))
 
@@ -1144,7 +1361,123 @@ with tab5:
         xaxis_title="Estimated system capex (€)",
         yaxis_title="Annual savings (€)",
     )
+    st.caption("Line = Pareto frontier (most efficient configurations). Colors = efficiency score (green=better ROI per euro, red=worse). Point size = design quality.")
     st.plotly_chart(fig_pf, width="stretch")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+with tab6:
+    st.markdown('<div class="chart-panel">', unsafe_allow_html=True)
+    st.caption("Advisor mode evaluates many configurations and explains the best recommendation.")
+
+    c_goal, c_budget, c_maxpv, c_q = st.columns(4)
+    with c_goal:
+        objective = st.selectbox(
+            "Goal",
+            ["highest_roi", "lowest_bill", "fastest_payback", "sustainability", "grid_independence"],
+            index=0,
+            key="advisor_goal",
+        )
+    with c_budget:
+        budget = st.number_input("Budget (EUR)", min_value=0, max_value=100000, value=25000, step=500, key="advisor_budget")
+    with c_maxpv:
+        max_pv = st.slider(
+            "Max PV (kWp)",
+            min_value=1,
+            max_value=20,
+            value=12,
+            step=1,
+            help="Realistic constraint: typical Dutch roofs fit 8-12 kWp. Override if you have extra space.",
+            key="advisor_max_pv",
+        )
+    with c_q:
+        advisor_question = st.selectbox(
+            "Question",
+            [
+                "How many solar panels should I install?",
+                "How large should my battery be?",
+                "Is a battery worth it?",
+                "Is V2G profitable for my situation?",
+            ],
+            key="advisor_question",
+        )
+
+    bounds = {
+        "solar_kwp": (0, 20),
+        "battery_kwh": (0, 20),
+        "heat_pump_enabled": hp_enabled,
+        "ev_enabled": ev_enabled,
+        "v2g_enabled": False,
+        "charging_strategies": ["pv_optimized", "price_optimized"],
+        "max_pv_kwp": max_pv,
+    }
+    steps = {"solar_kwp": 2, "battery_kwh": 2}
+    context = {
+        "import_price": import_price,
+        "feedin_tariff": feedin_tariff,
+        "household_kwh_day": household_base_effective,
+        "heat_pump_kwh_day": hp_daily_effective,
+        "ev_weekly_kwh": ev_weekly,
+        "airco_kwh_day": ac_daily_effective,
+        "price_solar_per_kwp": float(price_solar),
+        "price_battery_per_kwh": float(price_battery),
+        "price_ev_charger": float(price_ev),
+        "price_heat_pump": float(price_hp) * (hp_daily / 1.5 if hp_daily > 0 else 0.0),
+        "budget_eur": float(budget) if budget > 0 else None,
+    }
+
+    candidates = generate_candidates(bounds, steps)
+    evals = [evaluate_candidate(c, context) for c in candidates]
+    goals = UserGoals(objective=objective, budget_eur=float(budget) if budget > 0 else None)
+    ranked = rank_candidates(evals, goals)
+    recs = recommend_top_configuration(ranked, top_n=3)
+
+    if not recs:
+        st.warning("No feasible recommendation found within constraints.")
+    else:
+        top = recs[0]
+        st.markdown(metric_card(
+            "Top recommendation",
+            f"PV {ranked[0].candidate.solar_kwp:.0f} kWp · Battery {ranked[0].candidate.battery_kwh:.0f} kWh",
+            f"Objective: {objective} · Confidence: {top.confidence}",
+            cls="good",
+        ), unsafe_allow_html=True)
+
+        rr1, rr2, rr3 = st.columns(3)
+        with rr1:
+            st.markdown(metric_card("Expected annual savings", fmt_eur(top.expected_savings_eur_year), "Estimated"), unsafe_allow_html=True)
+        with rr2:
+            st.markdown(metric_card("Estimated investment", fmt_eur(top.investment_eur), "Capex"), unsafe_allow_html=True)
+        with rr3:
+            st.markdown(metric_card("Simple payback", f"{top.payback_years:.1f} years" if np.isfinite(top.payback_years) else "N/A", "Advisor estimate"), unsafe_allow_html=True)
+
+        st.markdown("**Recommendation Rationale**")
+        for line in top.why:
+            st.write(f"- {line}")
+
+        q_answer = answer_user_question(advisor_question, ranked, context)
+        st.markdown("**Answer To Selected Question**")
+        st.write(q_answer.title)
+        st.write(q_answer.action)
+        for line in q_answer.why:
+            st.write(f"- {line}")
+
+        top_rows = []
+        for i, ev in enumerate(ranked[:10], start=1):
+            top_rows.append(
+                {
+                    "rank": i,
+                    "solar_kwp": ev.candidate.solar_kwp,
+                    "battery_kwh": ev.candidate.battery_kwh,
+                    "strategy": ev.candidate.charging_strategy,
+                    "annual_savings_eur": ev.annual_savings_eur,
+                    "capex_eur": ev.capex_eur,
+                    "payback_years": ev.payback_years,
+                    "score": ev.score,
+                }
+            )
+        st.dataframe(top_rows, use_container_width=True)
+
     st.markdown('</div>', unsafe_allow_html=True)
 
 st.markdown("<br>", unsafe_allow_html=True)
